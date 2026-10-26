@@ -9,10 +9,9 @@
 //! human/LLM correction hook.
 
 use serde_json::{Value, json};
-use solidcraft_geom::Vec3;
 
 use super::CommandSpec;
-use crate::params::{bad, num, string_list};
+use crate::params::{bad, num, str_, string_list};
 use crate::{Result, Session};
 
 pub static COMMANDS: &[CommandSpec] = &[
@@ -24,6 +23,10 @@ pub static COMMANDS: &[CommandSpec] = &[
         "source?: body (default: the only body); holes?: keep detected holes (default true); \
          dry_run?: return the recipe without building (default false); name?: new body name \
          → the parametric rebuild (a box plus one hole feature per hole)",
+    ),
+    CommandSpec::new("reverse.verify", "Verify Rebuild", verify).icon("compare").noundo().params(
+        "source, rebuilt: body names (or a, b); tolerance_mm?: mm (default 0.01) → whether the rebuild matches the import: \
+         match, verdict, deviation, regions [{side, volume_mm3, max_deviation_mm, center, match}], warnings",
     ),
 ];
 
@@ -274,6 +277,39 @@ fn rebuild_plate(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"body": name, "holes_built": holes.len(), "steps_built": built, "recipe": recipe}))
 }
 
+/// The two bodies to compare: `source` + `rebuilt` (or `a` + `b`). Named explicitly, no guessing.
+fn verify_pair(p: &Value, cmd: &str) -> Result<(String, String)> {
+    let pick = |keys: &[&str]| keys.iter().find_map(|k| str_(p, k).map(str::to_string));
+    match (pick(&["source", "a"]), pick(&["rebuilt", "b"])) {
+        (Some(a), Some(b)) => Ok((a, b)),
+        _ => Err(bad(cmd, "give `source` and `rebuilt` (or `a` and `b`)")),
+    }
+}
+
+fn verify(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "reverse.verify";
+    let tol = tolerance_mm(p, cmd)?;
+    let (source, rebuilt) = verify_pair(p, cmd)?;
+    let cmp = s.execute("inspect.compare", &json!({"a": source, "b": rebuilt, "tolerance": tol}))?;
+    let identical = cmp.get("identical").and_then(Value::as_bool).unwrap_or(false);
+    let regions: Vec<Value> = cmp
+        .get("regions")
+        .and_then(Value::as_array)
+        .map(|rs| {
+            rs.iter()
+                .map(|r| {
+                    json!({"side": r.get("side"), "material_of": r.get("material_of"),
+                           "volume_mm3": r.get("volume_mm3"), "max_deviation_mm": r.get("max_deviation_mm"),
+                           "center": r.get("center"), "match": false})
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(json!({"source": source, "rebuilt": rebuilt, "match": identical, "identical": identical,
+              "verdict": cmp.get("verdict"), "deviation": cmp.get("deviation"),
+              "regions": regions, "warnings": cmp.get("warnings").cloned().unwrap_or(json!([]))}))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,11 +374,39 @@ mod tests {
     }
 
     #[test]
+    fn verify_matches_rebuild_and_flags_change() {
+        let (mut s, _hint) = round_trip();
+        let bodies: Vec<String> = s.execute("inspect.measure", &json!({})).unwrap()["bodies"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|b| b.get("name")?.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+        assert_eq!(bodies.len(), 1, "one imported body, got {bodies:?}");
+        let src = bodies[0].clone();
+        let done = run(&mut s, "reverse.rebuild_plate", json!({"source": src, "name": "Plate2"}));
+        assert_eq!(done["holes_built"], 2, "built: {done}");
+        let ok = run(&mut s, "reverse.verify", json!({"source": src, "rebuilt": "Plate2"}));
+        assert_eq!(ok["match"], true, "verify: {ok}");
+        assert_eq!(ok["identical"], true, "verify: {ok}");
+        assert_eq!(ok["regions"].as_array().map(Vec::len), Some(0), "verify: {ok}");
+        run(
+            &mut s,
+            "solid.box",
+            json!({"length": 10, "width": 8, "height": 0.5, "corner": [10, 10, 4.5], "operation": "cut", "targets": ["Plate2"]}),
+        );
+        let changed = run(&mut s, "reverse.verify", json!({"source": src, "rebuilt": "Plate2"}));
+        assert_eq!(changed["match"], false, "verify: {changed}");
+        assert_eq!(changed["regions"].as_array().map(Vec::len), Some(1), "verify: {changed}");
+        assert_eq!(changed["regions"][0]["match"], false, "verify: {changed}");
+    }
+
+    #[test]
     fn hostile_params_never_panic() {
         let mut s = Session::default();
         assert!(s.execute("reverse.classify", &json!({"tolerance_mm": -5.0})).is_err());
         assert!(s.execute("reverse.classify", &json!({"body": "Nope"})).is_err());
         assert!(s.execute("reverse.classify", &json!({})).is_err());
         assert!(s.execute("reverse.rebuild_plate", &json!({"source": "Nope"})).is_err());
+        assert!(s.execute("reverse.verify", &json!({})).is_err());
+        assert!(s.execute("reverse.verify", &json!({"source": "Nope", "rebuilt": "Missing"})).is_err());
     }
 }
