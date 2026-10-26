@@ -405,9 +405,9 @@ mod tests {
         s
     }
 
-    fn round_trip() -> (Session, String) {
+    fn round_trip(dir: &str) -> (Session, String) {
         let mut s = plate_session();
-        let dir = std::env::temp_dir().join("reverse_round_trip");
+        let dir = std::env::temp_dir().join(dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("plate.step");
         run(&mut s, "file.export", json!({"path": path.to_string_lossy(), "format": "step"}));
@@ -418,7 +418,7 @@ mod tests {
 
     #[test]
     fn flat_plate_round_trip() {
-        let (mut s, _hint) = round_trip();
+        let (mut s, _hint) = round_trip("reverse_round_trip");
         // The import names bodies after the file; find the single solid body.
         let bodies: Vec<String> = s.execute("inspect.measure", &json!({})).unwrap()["bodies"]
             .as_array()
@@ -453,7 +453,7 @@ mod tests {
 
     #[test]
     fn verify_matches_rebuild_and_flags_change() {
-        let (mut s, _hint) = round_trip();
+        let (mut s, _hint) = round_trip("reverse_verify");
         let bodies: Vec<String> = s.execute("inspect.measure", &json!({})).unwrap()["bodies"]
             .as_array()
             .map(|a| a.iter().filter_map(|b| b.get("name")?.as_str().map(str::to_string)).collect())
