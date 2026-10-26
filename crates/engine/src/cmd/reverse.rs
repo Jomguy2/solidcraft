@@ -90,6 +90,66 @@ fn tolerance_mm(p: &Value, cmd: &str) -> Result<f64> {
     Ok(t)
 }
 
+/// A turned part: every curved face is a cylinder about one axis and every flat
+/// face is square to it. Evidence only — rebuild is not supported yet, so this
+/// returns the measurements with `supported: false` instead of guessing a tree.
+/// `None` means "not turned": the plate search (or a refusal) runs as before.
+fn turned_evidence(body: &str, faces: &[&Value], bmin: [f64; 3], bmax: [f64; 3], tol: f64) -> Option<Value> {
+    let mut walls: Vec<([f64; 3], [f64; 3], f64)> = Vec::new();
+    for f in faces {
+        let Some(cyl) = f.get("cylinder") else {
+            continue;
+        };
+        let (Some(ax), Some(org), Some(r)) =
+            (cyl.get("axis").and_then(v3), cyl.get("origin").and_then(v3), cyl.get("radius").and_then(Value::as_f64))
+        else {
+            return None;
+        };
+        let len = (ax[0] * ax[0] + ax[1] * ax[1] + ax[2] * ax[2]).sqrt();
+        if !len.is_finite() || len <= 0.0 || !r.is_finite() || r <= 0.0 {
+            return None;
+        }
+        walls.push(([ax[0] / len, ax[1] / len, ax[2] / len], org, r));
+    }
+    if walls.is_empty() {
+        return None;
+    }
+    let (axis, origin) = (walls[0].0, walls[0].1);
+    for (ax, org, _) in &walls {
+        if dot(*ax, axis).abs() < PARALLEL_DOT {
+            return None;
+        }
+        let w = sub(*org, origin);
+        let along = dot(w, axis);
+        if dot(w, w) - along * along > (COAXIAL_SLACK * tol) * (COAXIAL_SLACK * tol) {
+            return None;
+        }
+    }
+    for f in faces {
+        if f.get("cylinder").is_some() {
+            continue;
+        }
+        let square = f.get("plane_normal").and_then(v3).map(|n| dot(n, axis).abs() > PARALLEL_DOT).unwrap_or(false);
+        if !square {
+            return None;
+        }
+    }
+    let mut radii: Vec<f64> = walls.iter().map(|w| w.2).collect();
+    radii.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mut uniq: Vec<f64> = Vec::new();
+    for r in radii {
+        if uniq.last().map(|last: &f64| (r - *last).abs() > tol).unwrap_or(true) {
+            uniq.push(r);
+        }
+    }
+    let d = sub(bmax, bmin);
+    let length = (d[0] * axis[0] + d[1] * axis[1] + d[2] * axis[2]).abs();
+    Some(json!({"body": body, "supported": false, "category": "turned",
+              "axis": {"origin": origin, "dir": axis}, "length": length, "radii": uniq,
+              "reasons": [format!("turned part about one axis ({} cylindrical face(s), length {length:.3} mm): rebuild not supported yet", walls.len())],
+              "unmatched": []}))
+}
+
 fn classify_body(s: &mut Session, body: &str, tol: f64) -> Result<Value> {
     let mut reasons: Vec<Value> = Vec::new();
     let mut unmatched: Vec<Value> = Vec::new();
@@ -113,6 +173,13 @@ fn classify_body(s: &mut Session, body: &str, tol: f64) -> Result<Value> {
         return Ok(refuse(&reasons, &unmatched, "the body has no bounding box"));
     };
     let size = [bmax[0] - bmin[0], bmax[1] - bmin[1], bmax[2] - bmin[2]];
+
+    // Turned parts before plates: a rod read end-on looks like "two opposing
+    // planar faces with one through-hole the size of itself". Cylinders about
+    // one axis with every flat face square to it is turned, never a plate.
+    if let Some(turned) = turned_evidence(body, &faces, bmin, bmax, tol) {
+        return Ok(turned);
+    }
 
     // Plate faces: the two largest planar faces with opposite normals.
     let mut normals: Vec<([f64; 3], [f64; 3], f64, usize)> = Vec::new();
@@ -218,6 +285,17 @@ fn classify_body(s: &mut Session, body: &str, tol: f64) -> Result<Value> {
         let c = bores[i].3;
         let center = [c[0], c[1], top_z];
         holes.push(json!({"center": center, "diameter": 2.0 * r}));
+    }
+    // A through-hole must sit inside the rectangular outline: a "hole" as wide
+    // as the plate is the part itself (a rod read end-on), not a hole in it.
+    for h in &holes {
+        let (Some(c), Some(d)) = (h.get("center").and_then(v3), h.get("diameter").and_then(Value::as_f64)) else {
+            continue;
+        };
+        let r = d / 2.0;
+        if c[0] - bmin[0] - r <= tol || bmax[0] - c[0] - r <= tol || c[1] - bmin[1] - r <= tol || bmax[1] - c[1] - r <= tol {
+            unmatched.push(json!({"center": c, "diameter": d, "why": "hole breaks the plate outline"}));
+        }
     }
     if !unmatched.is_empty() {
         return Ok(refuse(&reasons, &unmatched, "faces the flat-plate recipe cannot explain (see unmatched)"));
@@ -397,6 +475,28 @@ mod tests {
         assert_eq!(changed["match"], false, "verify: {changed}");
         assert_eq!(changed["regions"].as_array().map(Vec::len), Some(1), "verify: {changed}");
         assert_eq!(changed["regions"][0]["match"], false, "verify: {changed}");
+    }
+
+    #[test]
+    fn turned_rod_classifies_but_rebuild_refuses() {
+        let mut s = Session::default();
+        run(&mut s, "solid.cylinder", json!({"radius": 10, "height": 20, "body_name": "Rod"}));
+        let dir = std::env::temp_dir().join("reverse_turned");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rod.step");
+        run(&mut s, "file.export", json!({"path": path.to_string_lossy(), "format": "step"}));
+        let mut r = Session::default();
+        let _ = run(&mut r, "file.insert_step", json!({"path": path.to_string_lossy()}));
+        let bodies: Vec<String> = r.execute("inspect.measure", &json!({})).unwrap()["bodies"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|b| b.get("name")?.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+        assert_eq!(bodies.len(), 1, "one imported body, got {bodies:?}");
+        let found = run(&mut r, "reverse.classify", json!({"body": bodies[0]}));
+        assert_eq!(found["supported"], false, "classify: {found}");
+        assert_eq!(found["category"], "turned", "classify: {found}");
+        let err = r.execute("reverse.rebuild_plate", &json!({"source": bodies[0]}));
+        assert!(err.is_err(), "rebuild must refuse turned");
     }
 
     #[test]
