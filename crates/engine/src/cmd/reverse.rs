@@ -325,7 +325,7 @@ fn rebuild_plate(s: &mut Session, p: &Value) -> Result<Value> {
     let found = classify_body(s, &source, tol)?;
     if !found.get("supported").and_then(Value::as_bool).unwrap_or(false) {
         let why = found.get("reasons").and_then(Value::as_array).and_then(|r| r.first()).cloned().unwrap_or(json!("unsupported shape"));
-        return Err(crate::params::bad(cmd, &format!("not supported yet: {why}")));
+        return Err(crate::params::bad(cmd, format!("not supported yet: {why}")));
     }
     let get = |k: &str| found.get(k).and_then(Value::as_f64).unwrap_or(0.0);
     let corner = found.get("corner").and_then(v3).unwrap_or([0.0, 0.0, 0.0]);
