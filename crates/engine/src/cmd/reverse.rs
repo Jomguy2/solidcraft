@@ -21,7 +21,8 @@ pub static COMMANDS: &[CommandSpec] = &[
     ),
     CommandSpec::new("reverse.rebuild_plate", "Rebuild Plate Parametrically", rebuild_plate).icon("box").params(
         "source?: body (default: the only body); holes?: keep detected holes (default true); \
-         dry_run?: return the recipe without building (default false); name?: new body name \
+         dry_run?: return the recipe without building (default false); name?: new body name; \
+         remove_source?: delete the import after building (default false) \
          → the parametric rebuild (a box plus one hole feature per hole)",
     ),
     CommandSpec::new("reverse.verify", "Verify Rebuild", verify).icon("compare").noundo().params(
@@ -352,7 +353,15 @@ fn rebuild_plate(s: &mut Session, p: &Value) -> Result<Value> {
         s.execute(id, &params)?;
         built += 1;
     }
-    Ok(json!({"body": name, "holes_built": holes.len(), "steps_built": built, "recipe": recipe}))
+    // Opt-in cleanup for the convert flow: the import is scaffolding, so drop
+    // it after a successful build (one undo step with the build). Verify first
+    // if you need the comparison — it needs both bodies.
+    let remove = p.get("remove_source").and_then(Value::as_bool).unwrap_or(false);
+    if remove {
+        let del = super::find_command("selection.delete").ok_or_else(|| bad(cmd, "selection.delete unavailable"))?;
+        del.run_nested(s, &json!({"items": [{"type": "body", "name": source}]}))?;
+    }
+    Ok(json!({"body": name, "holes_built": holes.len(), "steps_built": built, "recipe": recipe, "source_removed": remove}))
 }
 
 /// The two bodies to compare: `source` + `rebuilt` (or `a` + `b`). Named explicitly, no guessing.
@@ -497,6 +506,24 @@ mod tests {
         assert_eq!(found["category"], "turned", "classify: {found}");
         let err = r.execute("reverse.rebuild_plate", &json!({"source": bodies[0]}));
         assert!(err.is_err(), "rebuild must refuse turned");
+    }
+
+    #[test]
+    fn rebuild_remove_source_leaves_only_rebuilt() {
+        let (mut s, _hint) = round_trip("reverse_replace");
+        let bodies: Vec<String> = s.execute("inspect.measure", &json!({})).unwrap()["bodies"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|b| b.get("name")?.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+        assert_eq!(bodies.len(), 1, "one imported body, got {bodies:?}");
+        let src = bodies[0].clone();
+        let done = run(&mut s, "reverse.rebuild_plate", json!({"source": src, "name": "Plate2", "remove_source": true}));
+        assert_eq!(done["holes_built"], 2, "built: {done}");
+        let after: Vec<String> = s.execute("inspect.measure", &json!({})).unwrap()["bodies"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|b| b.get("name")?.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+        assert_eq!(after, vec!["Plate2".to_string()], "source must be gone, got {after:?}");
     }
 
     #[test]
